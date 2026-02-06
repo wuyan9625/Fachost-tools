@@ -74,7 +74,7 @@ update_bili_whitelist() {
     local tmp_file="/tmp/bili_domains.txt"
     local tset; tset=$(tmpname "$BILI_SET")
     
-    # 下載清單 (失敗不中斷)
+    # 下載清單
     if ! curl -fsSL "$BILI_URL" | grep -vE "^#|include:|regexp:" | sed 's/full://g;s/domain://g' > "$tmp_file"; then
         echo "WARN: Bilibili list download failed."
         return
@@ -83,12 +83,12 @@ update_bili_whitelist() {
     ipset create -exist "$tset" hash:ip family inet
     ipset flush "$tset"
 
-    # 修正 2: 增加容錯解析，防止腳本崩潰
+    # 只解析 IPv4 (移除 IPv6 解析)
     if [[ -s "$tmp_file" ]]; then
         while read -r domain; do
             [[ -z "$domain" ]] && continue
             for d in "$domain" "www.$domain" "api.$domain"; do
-                # 使用 || true 強制忽略解析錯誤
+                # 這裡只留 ahostsv4，原本的 ahostsv6 已經刪除
                 { getent ahostsv4 "$d" 2>/dev/null || true; } | awk '{print $1}' | sort -u | while read -r ip; do
                     ipset add "$tset" "$ip" -exist 2>/dev/null || true
                 done
@@ -98,9 +98,8 @@ update_bili_whitelist() {
 
     ipset swap "$tset" "$BILI_SET"
     ipset destroy "$tset" 2>/dev/null || true
-    echo " -> Bilibili 白名單解析完成"
+    echo " -> Bilibili 白名單解析完成 (僅 IPv4)"
 }
-
 do_update() {
   update_set "$CN_IPV4_URL" "$CN4_SET" net inet
   update_set "$CN_IPV6_URL" "$CN6_SET" net inet6
