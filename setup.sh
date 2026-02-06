@@ -1,21 +1,18 @@
 #!/bin/bash
 # =========================================================
-# Block-FW | PVE 自動化出站防火牆 (全域修復版 v2)
+# Block-FW | PVE 防火牆 
 # =========================================================
 
 # --- 設定區 ---
 SCRIPT_NAME="block-fw"
 INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
 DATA_DIR="/var/lib/block-fw"
-
-# --- 你的 GitHub 腳本網址 (用於自我安裝) ---
-# 這是修復菜單打不開的關鍵，必須指向你自己的 raw 網址
 MY_GITHUB_URL="https://raw.githubusercontent.com/wuyan9625/block_tools/main/setup.sh"
 
-# --- 外部清單來源 (已更換為 GitHub Mirror 穩定源) ---
+# --- 外部清單來源 ---
 URL_CN="https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt"
+# 使用更穩定的 GitHub Mirror
 URL_MALWARE="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
-# 更換為 GitHub Mirror 避免 404
 URL_P2P="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/iblocklist_level1.netset"
 
 # --- 本地暫存檔 ---
@@ -41,112 +38,107 @@ mkdir -p "$DATA_DIR"
 # 核心功能
 # =======================
 
-# 下載並整合所有清單
-fetch_rules() {
-    echo -e "${YELLOW}[*] 正在同步清單 (CN + P2P + Malware)...${PLAIN}"
+# 強制開啟網橋過濾 (這是最關鍵的一步)
+enable_bridge_filter() {
+    echo -e "${YELLOW}[*] 正在強制開啟網橋過濾 (br_netfilter)...${PLAIN}"
+    modprobe br_netfilter
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
+    echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
     
-    # 建立暫存檔
+    # 寫入 sysctl.conf 確保重開機生效
+    if ! grep -q "net.bridge.bridge-nf-call-iptables = 1" /etc/sysctl.conf; then
+        echo "net.bridge.bridge-nf-call-iptables = 1" >> /etc/sysctl.conf
+        echo "net.bridge.bridge-nf-call-ip6tables = 1" >> /etc/sysctl.conf
+    fi
+    sysctl -p >/dev/null 2>&1
+}
+
+fetch_rules() {
+    echo -e "${YELLOW}[*] 正在同步清單...${PLAIN}"
     > "${FILE_COMBINED}.tmp"
 
-    # 1. 下載 CN IP
     echo -e " -> 下載 CN IP..."
     curl -fsSL "$URL_CN" >> "${FILE_COMBINED}.tmp"
-
-    # 2. 下載 P2P & Malware
-    echo -e " -> 下載 P2P 與 惡意 IP..."
+    echo -e " -> 下載 P2P & 惡意 IP..."
     curl -fsSL "$URL_MALWARE" >> "${FILE_COMBINED}.tmp"
     curl -fsSL "$URL_P2P" >> "${FILE_COMBINED}.tmp"
     
     if [ -s "${FILE_COMBINED}.tmp" ]; then
-        # 過濾處理：移除註解、空行、私有 IP (避免誤殺內網)
-        # 這裡會過濾掉 10.x, 192.168.x, 172.16-31.x, 127.x
         grep -vE "^#|^$|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^127\." "${FILE_COMBINED}.tmp" > "$FILE_COMBINED"
         rm "${FILE_COMBINED}.tmp"
-        echo -e "${GREEN} -> 規則整合完成 (已包含 CN 強制封鎖)${PLAIN}"
+        echo -e "${GREEN} -> 規則已更新${PLAIN}"
     else
-        echo -e "${RED} [!] 清單下載失敗，保留舊檔${PLAIN}"
+        echo -e "${RED} [!] 下載失敗，使用舊檔${PLAIN}"
     fi
 }
 
 apply_rules() {
-    local block_inbound="$1" # yes/no
+    local block_inbound="$1"
 
     if [ ! -f "$FILE_COMBINED" ]; then
-        echo -e "${RED}找不到規則檔案，請先執行更新${PLAIN}"
+        echo -e "${RED}錯誤：找不到清單檔案${PLAIN}"
         return
     fi
 
-    echo -e "${YELLOW}[*] 正在載入 IPSET (請稍候)...${PLAIN}"
+    # 1. 確保核心模組開啟
+    enable_bridge_filter
+
+    # 2. 載入 IPSET
+    echo -e "${YELLOW}[*] 載入 IPSET...${PLAIN}"
     ipset create "$IPSET_NAME" hash:net -exist
     ipset flush "$IPSET_NAME"
-    # 使用 -exist 靜音重複 IP 的警告
     ipset restore -exist < <(sed "s/^/add $IPSET_NAME /" "$FILE_COMBINED")
 
-    echo -e "${YELLOW}[*] 設定 iptables 全域規則...${PLAIN}"
+    # 3. 設定防火牆 (使用 RAW 表 PREROUTING 鏈，這是最優先的攔截點)
+    echo -e "${YELLOW}[*] 設定 iptables (使用 RAW 表 PREROUTING)...${PLAIN}"
 
-    # 1. 強力清除舊規則
-    iptables-save | grep "$RULE_COMMENT" | sed 's/^-A/-D/' | while read -r line; do
-        iptables $line 2>/dev/null
-    done
-    # 雙重保險
-    iptables -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    iptables -D FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    # 清除舊規則 (包含 filter 表和 raw 表)
+    iptables -t filter -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    iptables -t filter -D FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
 
-    # 2. 【強制】封鎖出站 (Forward 到黑名單 IP)
-    iptables -I FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT"
+    # 【核彈規則】 RAW 表 PREROUTING - 封包剛到網卡就被殺掉，無法繞過
+    # 攔截出站 (去往黑名單)
+    iptables -t raw -I PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT"
     
-    # 3. 【可選】封鎖入站 (黑名單 IP 連入)
+    # 攔截入站 (來自黑名單)
     if [[ "$block_inbound" == "yes" ]]; then
-        iptables -I FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT"
-        echo -e "${GREEN} -> [出站+入站] 全域防護已生效${PLAIN}"
+        iptables -t raw -I PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT"
+        echo -e "${GREEN} -> [雙向封鎖] RAW 表規則已生效${PLAIN}"
     else
-        echo -e "${GREEN} -> [僅出站] 全域防護已生效 (允許 CN 連入)${PLAIN}"
+        echo -e "${GREEN} -> [僅出站] RAW 表規則已生效${PLAIN}"
     fi
 }
 
 setup_cron() {
     local block_inbound="$1"
     local cron_cmd="0 4 * * * $INSTALL_PATH update $block_inbound > /dev/null 2>&1"
-    
     (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME"; echo "$cron_cmd") | crontab -
-    echo -e "${GREEN}[*] 已設定每日 04:00 自動更新${PLAIN}"
 }
 
 install_self() {
-    echo -e "${YELLOW}[*] 正在安裝腳本至系統...${PLAIN}"
-    # 【關鍵修復】從 GitHub 下載自身，而不是複製 $0
     curl -fsSL "$MY_GITHUB_URL" -o "$INSTALL_PATH"
     chmod +x "$INSTALL_PATH"
-    echo -e "${GREEN}[OK] 安裝完成！輸入 block-fw 即可喚出選單${PLAIN}"
 }
 
 uninstall() {
-    echo -e "${YELLOW}正在移除規則...${PLAIN}"
-    iptables-save | grep "$RULE_COMMENT" | sed 's/^-A/-D/' | while read -r line; do
-        iptables $line 2>/dev/null
-    done
+    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    # 清理舊 filter 表殘留
+    iptables -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
     
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
     rm -rf "$DATA_DIR"
     rm -f "$INSTALL_PATH"
     crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME" | crontab -
-    echo -e "${GREEN}防護已完全移除${PLAIN}"
-}
-
-stats() {
-    echo "=== 攔截封包統計 (Global) ==="
-    echo "DST match = 攔截 VM 訪問外部 (出站)"
-    echo "SRC match = 攔截 外部 訪問 VM (入站)"
-    iptables -L FORWARD -v -n | grep "$RULE_COMMENT"
-    echo -e "\n=== IPSET 條目數 ==="
-    ipset list "$IPSET_NAME" | grep "Number of entries"
+    echo -e "${GREEN}已移除${PLAIN}"
 }
 
 # =======================
 # 主流程
 # =======================
 
-# Cron 自動更新模式
 if [[ "$1" == "update" ]]; then
     block_inbound=${2:-no}
     fetch_rules
@@ -156,12 +148,11 @@ fi
 
 clear
 echo -e "==========================================="
-echo -e " Block-FW | PVE 防火牆 (全域修復版 v2)"
+echo -e " Block-FW | PVE 防火牆 (v3 RAW 核彈版)"
 echo -e "==========================================="
-echo -e " 1. 部署防護 (修復 404 及 菜單失效問題)"
-echo -e " 2. 查看統計"
-echo -e " 3. 手動更新清單"
-echo -e " 4. 移除防護"
+echo -e " 1. 部署防護 (強制開啟 Bridge Filter)"
+echo -e " 2. 手動更新清單"
+echo -e " 3. 移除防護"
 echo -e " 0. 離開"
 echo -e "==========================================="
 read -p "選項: " opt
@@ -169,29 +160,17 @@ read -p "選項: " opt
 case "$opt" in
     1)
         install_self
-        
-        echo -e "\n${YELLOW}關於流量方向設定：${PLAIN}"
-        echo -e "1. ${GREEN}出站 (Outbound)${PLAIN}: VM -> CN/P2P。 ${RED}[強制封鎖]${PLAIN}"
-        
-        read -p "是否也要封鎖【入站 (Inbound)】流量? [y/N]: " in_opt
-        if [[ "$in_opt" == "y" || "$in_opt" == "Y" ]]; then
-            block_inbound="yes"
-        else
-            block_inbound="no"
-        fi
-        
+        read -p "是否封鎖入站? [y/N]: " in_opt
+        [[ "$in_opt" == "y" || "$in_opt" == "Y" ]] && block_inbound="yes" || block_inbound="no"
         fetch_rules
         apply_rules "$block_inbound"
         setup_cron "$block_inbound"
         ;;
     2)
-        stats
+        fetch_rules
+        echo -e "${GREEN}請重新部署${PLAIN}"
         ;;
     3)
-        fetch_rules
-        echo -e "${GREEN}清單已下載，請重新部署以套用。${PLAIN}"
-        ;;
-    4)
         uninstall
         ;;
     0)
