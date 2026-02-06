@@ -1,6 +1,6 @@
 #!/bin/bash
 # =========================================================
-# Block-FW | PVE 自動化出站防火牆
+# Block-FW | PVE 自動化出站防火牆 (全域攔截版)
 # =========================================================
 
 # --- 設定區 ---
@@ -36,31 +36,6 @@ mkdir -p "$DATA_DIR"
 # 核心功能
 # =======================
 
-detect_vmbr() {
-    ip link show | awk -F: '/vmbr[0-9]+/ {print $2}' | tr -d ' '
-}
-
-select_vmbr() {
-    echo -e "${YELLOW}正在偵測可用網橋...${PLAIN}"
-    mapfile -t VMBrs < <(detect_vmbr)
-    
-    if [ ${#VMBrs[@]} -eq 0 ]; then
-        echo -e "${RED}未偵測到任何 vmbr 介面${PLAIN}"
-        exit 1
-    fi
-
-    for i in "${!VMBrs[@]}"; do
-        echo "[$i] ${VMBrs[$i]}"
-    done
-    echo
-    read -p "請輸入網橋編號（Enter 預設全部防護）： " idx
-    if [[ -z "$idx" ]]; then
-        echo "ALL"
-    else
-        echo "${VMBrs[$idx]}"
-    fi
-}
-
 # 下載並整合所有清單 (CN + Malware + P2P)
 fetch_rules() {
     echo -e "${YELLOW}[*] 正在同步清單 (CN + P2P + Malware)...${PLAIN}"
@@ -68,7 +43,7 @@ fetch_rules() {
     # 建立暫存檔
     > "${FILE_COMBINED}.tmp"
 
-    # 1. 下載 CN IP (因為你說出站一定要封，所以直接下載合併)
+    # 1. 下載 CN IP
     echo -e " -> 下載 CN IP..."
     curl -fsSL "$URL_CN" >> "${FILE_COMBINED}.tmp"
 
@@ -81,15 +56,15 @@ fetch_rules() {
         # 過濾處理：移除註解、空行、私有 IP (避免誤殺內網)
         grep -vE "^#|^$|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^127\." "${FILE_COMBINED}.tmp" > "$FILE_COMBINED"
         rm "${FILE_COMBINED}.tmp"
-        echo -e "${GREEN} -> 所有規則已合併完成 (包含 CN 強制封鎖)${PLAIN}"
+        echo -e "${GREEN} -> 規則整合完成 (已包含 CN 強制封鎖)${PLAIN}"
     else
         echo -e "${RED} [!] 清單下載失敗，將使用舊檔 (如果存在)${PLAIN}"
     fi
 }
 
 apply_rules() {
-    local vmbr="$1"
-    local block_inbound="$2" # yes/no
+    # 注意：這裡不再需要選擇 vmbr，因為改用全域攔截以確保不漏接
+    local block_inbound="$1" # yes/no
 
     if [ ! -f "$FILE_COMBINED" ]; then
         echo -e "${RED}找不到規則檔案，請先執行更新${PLAIN}"
@@ -101,41 +76,37 @@ apply_rules() {
     ipset flush "$IPSET_NAME"
     ipset restore < <(sed "s/^/add $IPSET_NAME /" "$FILE_COMBINED")
 
-    # 設定 iptables
-    local interfaces
-    if [[ "$vmbr" == "ALL" ]]; then
-        interfaces=$(detect_vmbr)
-    else
-        interfaces="$vmbr"
-    fi
+    echo -e "${YELLOW}[*] 設定 iptables 全域規則...${PLAIN}"
 
-    for b in $interfaces; do
-        # 1. 清除舊規則
-        iptables -D FORWARD -i "$b" -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-        iptables -D FORWARD -i "$b" -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-
-        # 2. 【強制】封鎖出站 (VM -> 黑名單/CN)
-        # dst = 封包的目的地是黑名單 IP
-        iptables -I FORWARD -i "$b" -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT"
-        
-        # 3. 【可選】封鎖入站 (黑名單/CN -> VM)
-        # src = 封包的來源是黑名單 IP
-        if [[ "$block_inbound" == "yes" ]]; then
-            iptables -I FORWARD -i "$b" -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT"
-            echo -e "${GREEN} -> [出站+入站] 皆已封鎖: $b${PLAIN}"
-        else
-            echo -e "${GREEN} -> [僅出站] 已封鎖: $b (允許 CN 連入)${PLAIN}"
-        fi
+    # 1. 強力清除舊規則 (包含所有介面的舊規則)
+    # 先列出所有相關規則並刪除，避免殘留
+    iptables-save | grep "$RULE_COMMENT" | sed 's/^-A/-D/' | while read -r line; do
+        iptables $line 2>/dev/null
     done
+    # 再次確保刪除全域規則
+    iptables -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    iptables -D FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+
+    # 2. 【強制】封鎖出站 (Forward 到黑名單 IP)
+    # 不指定 -i 介面，這樣才能攔截到從 tap/bridge 過來的流量
+    iptables -I FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT"
+    
+    # 3. 【可選】封鎖入站 (黑名單 IP 連入)
+    if [[ "$block_inbound" == "yes" ]]; then
+        iptables -I FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT"
+        echo -e "${GREEN} -> [出站+入站] 全域防護已生效${PLAIN}"
+    else
+        echo -e "${GREEN} -> [僅出站] 全域防護已生效 (允許 CN 連入)${PLAIN}"
+    fi
 }
 
 setup_cron() {
     local block_inbound="$1"
-    # 將選擇寫入 cron 指令中，這樣每天更新時會記得你的選擇
+    # 將選擇寫入 cron 指令中
     local cron_cmd="0 4 * * * $INSTALL_PATH update $block_inbound > /dev/null 2>&1"
     
     (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME"; echo "$cron_cmd") | crontab -
-    echo -e "${GREEN}[*] 已設定每日 04:00 自動更新 (入站封鎖: $block_inbound)${PLAIN}"
+    echo -e "${GREEN}[*] 已設定每日 04:00 自動更新${PLAIN}"
 }
 
 install_self() {
@@ -144,19 +115,21 @@ install_self() {
 }
 
 uninstall() {
-    for b in $(detect_vmbr); do
-        iptables -D FORWARD -i "$b" -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-        iptables -D FORWARD -i "$b" -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
+    echo -e "${YELLOW}正在移除規則...${PLAIN}"
+    # 清除所有帶有標記的規則
+    iptables-save | grep "$RULE_COMMENT" | sed 's/^-A/-D/' | while read -r line; do
+        iptables $line 2>/dev/null
     done
+    
     ipset destroy "$IPSET_NAME" 2>/dev/null || true
     rm -rf "$DATA_DIR"
     rm -f "$INSTALL_PATH"
     crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME" | crontab -
-    echo -e "${GREEN}防護已移除${PLAIN}"
+    echo -e "${GREEN}防護已完全移除${PLAIN}"
 }
 
 stats() {
-    echo "=== 攔截封包統計 ==="
+    echo "=== 攔截封包統計 (Global) ==="
     echo "DST match = 攔截 VM 訪問外部 (出站)"
     echo "SRC match = 攔截 外部 訪問 VM (入站)"
     iptables -L FORWARD -v -n | grep "$RULE_COMMENT"
@@ -170,17 +143,17 @@ stats() {
 
 # Cron 自動更新模式： ./block-fw update <yes/no>
 if [[ "$1" == "update" ]]; then
-    block_inbound=${2:-no} # 預設不封入站，除非 cron 指定
+    block_inbound=${2:-no}
     fetch_rules
-    apply_rules "ALL" "$block_inbound"
+    apply_rules "$block_inbound"
     exit 0
 fi
 
 clear
 echo -e "==========================================="
-echo -e " Block-FW | PVE 防火牆 (CN 出站強制封鎖版)"
+echo -e " Block-FW | PVE 防火牆 (全域修復版)"
 echo -e "==========================================="
-echo -e " 1. 部署防護 (選單)"
+echo -e " 1. 部署防護 (修復攔截失效問題)"
 echo -e " 2. 查看統計"
 echo -e " 3. 手動更新清單"
 echo -e " 4. 移除防護"
@@ -191,13 +164,12 @@ read -p "選項: " opt
 case "$opt" in
     1)
         install_self
-        vmbr=$(select_vmbr)
         
         echo -e "\n${YELLOW}關於流量方向設定：${PLAIN}"
         echo -e "1. ${GREEN}出站 (Outbound)${PLAIN}: VM -> CN/P2P。 ${RED}[強制封鎖]${PLAIN}"
-        echo -e "   (防止客戶濫用機器進行 P2P 下載或做回國跳板)\n"
+        echo -e "   (此版本採用全域攔截，保證所有 VM 生效)\n"
         
-        read -p "是否也要封鎖【入站 (Inbound)】流量? (防止 CN/惡意 IP 連接你的 VM) [y/N]: " in_opt
+        read -p "是否也要封鎖【入站 (Inbound)】流量? [y/N]: " in_opt
         if [[ "$in_opt" == "y" || "$in_opt" == "Y" ]]; then
             block_inbound="yes"
         else
@@ -205,7 +177,7 @@ case "$opt" in
         fi
         
         fetch_rules
-        apply_rules "$vmbr" "$block_inbound"
+        apply_rules "$block_inbound"
         setup_cron "$block_inbound"
         ;;
     2)
