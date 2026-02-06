@@ -1,182 +1,115 @@
 #!/bin/bash
-# =========================================================
-# Block-FW | PVE 防火牆 
-# =========================================================
+set -euo pipefail
 
-# --- 設定區 ---
-SCRIPT_NAME="block-fw"
-INSTALL_PATH="/usr/local/bin/$SCRIPT_NAME"
-DATA_DIR="/var/lib/block-fw"
-MY_GITHUB_URL="https://raw.githubusercontent.com/wuyan9625/block_tools/main/setup.sh"
+ACTION="${1:-}"
+SCRIPT_PATH="/usr/local/bin/cn-vm-egress-guard.sh"
 
-# --- 外部清單來源 ---
-URL_CN="https://raw.githubusercontent.com/gaoyifan/china-operator-ip/ip-lists/china.txt"
-# 使用更穩定的 GitHub Mirror
-URL_MALWARE="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/firehol_level1.netset"
-URL_P2P="https://raw.githubusercontent.com/firehol/blocklist-ipsets/master/iblocklist_level1.netset"
+# ===== 资源 =====
+CN_IPV4_URL="https://ruleset.skk.moe/Clash/ip/china_ip.txt"
+CN_IPV6_URL="https://ruleset.skk.moe/Clash/ip/china_ip_ipv6.txt"
+P2P_TRACKER_URL="https://raw.githubusercontent.com/ngosang/trackerslist/master/trackers_all_ip.txt"
 
-# --- 本地暫存檔 ---
-FILE_COMBINED="$DATA_DIR/blocked_combined.list"
-IPSET_NAME="fachost_block"
-RULE_COMMENT="block-fw"
+# ===== IPSET =====
+CN4_SET="cn_block4"
+CN6_SET="cn_block6"
+P2P_SET="p2p_trackers"
 
-# --- 顏色 ---
-GREEN="\033[32m"
-RED="\033[31m"
-YELLOW="\033[33m"
-PLAIN="\033[0m"
+# ===== CHAIN =====
+CHAIN="VM_EGRESS_FILTER"
 
-# 檢查 Root
-if [[ $EUID -ne 0 ]]; then
-   echo -e "${RED}錯誤：請使用 root 權限執行${PLAIN}"
-   exit 1
+# ---------- 基础校验 ----------
+if [[ "$ACTION" != "apply" && "$ACTION" != "update" ]]; then
+  echo "Usage: $0 {apply|update}"
+  exit 1
 fi
 
-mkdir -p "$DATA_DIR"
+need_cmd() { command -v "$1" >/dev/null 2>&1; }
+tmpname() { echo "${1}_tmp_$$"; }
 
-# =======================
-# 核心功能
-# =======================
+# ---------- 依赖 ----------
+if ! need_cmd ipset || ! need_cmd curl; then
+  apt-get update && apt-get install -y ipset curl
+fi
+if ! need_cmd iptables || ! need_cmd ip6tables; then
+  apt-get update && apt-get install -y iptables
+fi
 
-# 強制開啟網橋過濾 (這是最關鍵的一步)
-enable_bridge_filter() {
-    echo -e "${YELLOW}[*] 正在強制開啟網橋過濾 (br_netfilter)...${PLAIN}"
-    modprobe br_netfilter
-    echo 1 > /proc/sys/net/bridge/bridge-nf-call-iptables
-    echo 1 > /proc/sys/net/bridge/bridge-nf-call-ip6tables
-    
-    # 寫入 sysctl.conf 確保重開機生效
-    if ! grep -q "net.bridge.bridge-nf-call-iptables = 1" /etc/sysctl.conf; then
-        echo "net.bridge.bridge-nf-call-iptables = 1" >> /etc/sysctl.conf
-        echo "net.bridge.bridge-nf-call-ip6tables = 1" >> /etc/sysctl.conf
-    fi
-    sysctl -p >/dev/null 2>&1
+# ---------- IPSET 初始化 ----------
+ipset create -exist "$CN4_SET" hash:net family inet
+ipset create -exist "$CN6_SET" hash:net family inet6
+ipset create -exist "$P2P_SET" hash:ip  family inet
+
+# ---------- 更新函数 ----------
+update_set() {
+  local url="$1" set="$2" type="$3" family="$4"
+  local tmp="/tmp/${set}.txt"
+  curl -fsSL "$url" -o "$tmp" || {
+    echo "WARN: $set update failed, keep old data"
+    return 0
+  }
+
+  local tset; tset=$(tmpname "$set")
+  ipset create -exist "$tset" "hash:$type" family "$family"
+  ipset flush "$tset"
+
+  while read -r line; do
+    [[ -z "$line" || "$line" =~ ^# ]] && continue
+    ipset add "$tset" "$line" -exist 2>/dev/null || true
+  done < "$tmp"
+
+  ipset swap "$tset" "$set"
+  ipset destroy "$tset" 2>/dev/null || true
 }
 
-fetch_rules() {
-    echo -e "${YELLOW}[*] 正在同步清單...${PLAIN}"
-    > "${FILE_COMBINED}.tmp"
-
-    echo -e " -> 下載 CN IP..."
-    curl -fsSL "$URL_CN" >> "${FILE_COMBINED}.tmp"
-    echo -e " -> 下載 P2P & 惡意 IP..."
-    curl -fsSL "$URL_MALWARE" >> "${FILE_COMBINED}.tmp"
-    curl -fsSL "$URL_P2P" >> "${FILE_COMBINED}.tmp"
-    
-    if [ -s "${FILE_COMBINED}.tmp" ]; then
-        grep -vE "^#|^$|^10\.|^192\.168\.|^172\.(1[6-9]|2[0-9]|3[0-1])\.|^127\." "${FILE_COMBINED}.tmp" > "$FILE_COMBINED"
-        rm "${FILE_COMBINED}.tmp"
-        echo -e "${GREEN} -> 規則已更新${PLAIN}"
-    else
-        echo -e "${RED} [!] 下載失敗，使用舊檔${PLAIN}"
-    fi
+do_update() {
+  update_set "$CN_IPV4_URL" "$CN4_SET" net inet
+  update_set "$CN_IPV6_URL" "$CN6_SET" net inet6
+  update_set "$P2P_TRACKER_URL" "$P2P_SET" ip inet
+  echo "OK: ipset 更新完成"
 }
 
-apply_rules() {
-    local block_inbound="$1"
+# ---------- 防火墙 ----------
+apply_fw() {
+  iptables  -N "$CHAIN" 2>/dev/null || true
+  ip6tables -N "$CHAIN" 2>/dev/null || true
+  iptables  -F "$CHAIN"
+  ip6tables -F "$CHAIN"
 
-    if [ ! -f "$FILE_COMBINED" ]; then
-        echo -e "${RED}錯誤：找不到清單檔案${PLAIN}"
-        return
-    fi
+  # 仅 VM 新建出站连接进入
+  iptables -C FORWARD -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null \
+    || iptables -I FORWARD 1 -m conntrack --ctstate NEW -j "$CHAIN"
+  ip6tables -C FORWARD -m conntrack --ctstate NEW -j "$CHAIN" 2>/dev/null \
+    || ip6tables -I FORWARD 1 -m conntrack --ctstate NEW -j "$CHAIN"
 
-    # 1. 確保核心模組開啟
-    enable_bridge_filter
+  # 1. P2P Tracker 阻断（统计点）
+  iptables -A "$CHAIN" -m set --match-set "$P2P_SET" dst -j DROP
 
-    # 2. 載入 IPSET
-    echo -e "${YELLOW}[*] 載入 IPSET...${PLAIN}"
-    ipset create "$IPSET_NAME" hash:net -exist
-    ipset flush "$IPSET_NAME"
-    ipset restore -exist < <(sed "s/^/add $IPSET_NAME /" "$FILE_COMBINED")
+  # 2. 中国 IP 出站阻断（统计点）
+  iptables -A "$CHAIN" -m set --match-set "$CN4_SET" dst -j DROP
+  ip6tables -A "$CHAIN" -m set --match-set "$CN6_SET" dst -j DROP
 
-    # 3. 設定防火牆 (使用 RAW 表 PREROUTING 鏈，這是最優先的攔截點)
-    echo -e "${YELLOW}[*] 設定 iptables (使用 RAW 表 PREROUTING)...${PLAIN}"
+  # 3. 其他全部放行
+  iptables  -A "$CHAIN" -j RETURN
+  ip6tables -A "$CHAIN" -j RETURN
 
-    # 清除舊規則 (包含 filter 表和 raw 表)
-    iptables -t filter -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    iptables -t filter -D FORWARD -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-
-    # 【核彈規則】 RAW 表 PREROUTING - 封包剛到網卡就被殺掉，無法繞過
-    # 攔截出站 (去往黑名單)
-    iptables -t raw -I PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT"
-    
-    # 攔截入站 (來自黑名單)
-    if [[ "$block_inbound" == "yes" ]]; then
-        iptables -t raw -I PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT"
-        echo -e "${GREEN} -> [雙向封鎖] RAW 表規則已生效${PLAIN}"
-    else
-        echo -e "${GREEN} -> [僅出站] RAW 表規則已生效${PLAIN}"
-    fi
-}
-
-setup_cron() {
-    local block_inbound="$1"
-    local cron_cmd="0 4 * * * $INSTALL_PATH update $block_inbound > /dev/null 2>&1"
-    (crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME"; echo "$cron_cmd") | crontab -
+  echo "OK: 防火墙规则已应用"
 }
 
 install_self() {
-    curl -fsSL "$MY_GITHUB_URL" -o "$INSTALL_PATH"
-    chmod +x "$INSTALL_PATH"
+  if [[ ! -f "$SCRIPT_PATH" ]]; then
+    cp "$0" "$SCRIPT_PATH"
+    chmod +x "$SCRIPT_PATH"
+  fi
+  (crontab -l 2>/dev/null | grep -v "$SCRIPT_PATH update"; \
+   echo "0 3 * * * $SCRIPT_PATH update > /dev/null 2>&1") | crontab -
 }
 
-uninstall() {
-    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    iptables -t raw -D PREROUTING -m set --match-set "$IPSET_NAME" src -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    # 清理舊 filter 表殘留
-    iptables -D FORWARD -m set --match-set "$IPSET_NAME" dst -j DROP -m comment --comment "$RULE_COMMENT" 2>/dev/null || true
-    
-    ipset destroy "$IPSET_NAME" 2>/dev/null || true
-    rm -rf "$DATA_DIR"
-    rm -f "$INSTALL_PATH"
-    crontab -l 2>/dev/null | grep -v "$SCRIPT_NAME" | crontab -
-    echo -e "${GREEN}已移除${PLAIN}"
-}
-
-# =======================
-# 主流程
-# =======================
-
-if [[ "$1" == "update" ]]; then
-    block_inbound=${2:-no}
-    fetch_rules
-    apply_rules "$block_inbound"
-    exit 0
+# ---------- 主流程 ----------
+if [[ "$ACTION" == "apply" ]]; then
+  do_update
+  apply_fw
+  install_self
+  echo "Done: 宿主机 VM 出站管控已启用（带统计）"
+else
+  do_update
 fi
-
-clear
-echo -e "==========================================="
-echo -e " Block-FW | PVE 防火牆 (v3 RAW 核彈版)"
-echo -e "==========================================="
-echo -e " 1. 部署防護 (強制開啟 Bridge Filter)"
-echo -e " 2. 手動更新清單"
-echo -e " 3. 移除防護"
-echo -e " 0. 離開"
-echo -e "==========================================="
-read -p "選項: " opt
-
-case "$opt" in
-    1)
-        install_self
-        read -p "是否封鎖入站? [y/N]: " in_opt
-        [[ "$in_opt" == "y" || "$in_opt" == "Y" ]] && block_inbound="yes" || block_inbound="no"
-        fetch_rules
-        apply_rules "$block_inbound"
-        setup_cron "$block_inbound"
-        ;;
-    2)
-        fetch_rules
-        echo -e "${GREEN}請重新部署${PLAIN}"
-        ;;
-    3)
-        uninstall
-        ;;
-    0)
-        exit 0
-        ;;
-    *)
-        echo "無效選項"
-        ;;
-esac
