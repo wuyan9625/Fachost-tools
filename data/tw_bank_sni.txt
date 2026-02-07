@@ -1,32 +1,47 @@
-# ===== 富邦 =====
-pay.fubon.com.tw
-txn.fubon.com.tw
-api.fubon.com.tw
+# 1. 台北富邦 (Fubon) - 涵蓋 ebank.taipeifubon.com.tw
+fubon.com.tw
 taipeifubon.com.tw
 
-# ===== 國泰世華 =====
-txn.cathaybk.com.tw
-api.cathaybk.com.tw
-pay.cathaybk.com.tw
+# 2. 國泰世華 (Cathay United)
+cathaybk.com.tw
+cathayholdings.com
 
-# ===== 玉山 =====
-api.esunbank.com.tw
-pay.esunbank.com.tw
+# 3. 中國信託 (CTBC)
+ctbcbank.com
+chinatrust.com.tw
 
-# ===== 第一銀行 =====
-ibank.firstbank.com.tw
-txn.firstbank.com.tw
+# 4. 玉山銀行 (E.Sun)
+esunbank.com.tw
+esunbank.com
 
-# ===== 兆豐 =====
-api.megabank.com.tw
-txn.megabank.com.tw
+# 5. 台新銀行 (Taishin)
+taishinbank.com.tw
 
-# ===== 土地銀行 =====
-ebank.landbank.com.tw
-txn.landbank.com.tw
+# 6. 台灣銀行 (Bank of Taiwan)
+bot.com.tw
 
-# ===== 中華郵政 =====
-epost.post.gov.tw
-ipost.post.gov.tw
-pay.post.gov.tw
-api.post.gov.tw
+# 7. 兆豐銀行 (Mega Bank)
+megabank.com.tw
+
+# 8. 第一銀行 (First Bank)
+firstbank.com.tw
+
+# 9. 合作金庫 (TCB)
+tcb-bank.com.tw
+
+# 10. 華南銀行 (HNCB)
+hncb.com.tw
+
+# 11. 土地銀行 (Land Bank)
+landbank.com.tw
+
+# 12. 永豐銀行 (Sinopac)
+sinopac.com
+
+# 13. 中華郵政 (Post) - 儲匯與網銀
+post.gov.tw
+
+# 14. 街口支付 / LINE Pay 相關
+jkos.com
+line-apps.com
+line.me
